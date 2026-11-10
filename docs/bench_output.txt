@@ -1,0 +1,89 @@
+=============== 1. KERNEL HEAP: kmalloc (buddy + slab) vs glibc malloc ===============
+  3000000 alloc/free operations, ~20000 live objects, sizes 24..1000 B
+
+                                ns / op    per-object overhead   footprint / live bytes
+  MiniOS kmalloc (slab)            25.8                  1.22x                    1.26x
+  glibc malloc                     25.4                  1.05x                    1.11x
+  (failed MiniOS allocations: 0)
+  per-object overhead = bytes the live objects occupy after header / size-class rounding;
+  footprint = total memory the allocator holds, which also counts partly-filled slab pages / free chunks.
+  Caveat: both run in user space on the same op sequence. glibc is a different design
+  (arenas, tcache) tuned for threads; this shows trade-offs, not a claim to beat it.
+  MiniOS's kmalloc rounds up to power-of-two classes, which is where its extra overhead comes from
+  (the compressed pool uses finer-grained classes for exactly this reason).
+
+  Buddy allocator fragmentation: random order-0..3 alloc/free held near 70% utilization
+    2887 of 4096 frames in use; 1209 free, split across 41 blocks; largest free block: order 9 (2048 KiB)
+    external fragmentation index 0.58 (0 = one big block, 1 = all free memory in single frames)
+    after freeing everything: 4096 free in 4 maximum-size blocks (fully coalesced: yes)
+
+
+=============== 2. COMPRESSOR ON 4 KiB PAGES ===============
+  page contents          avg bytes   ratio   pool ok     compress   decompress
+  zero page              8 (same-fill)    512x      100%  no compress       memset
+  same byte (0xAB)       8 (same-fill)    512x      100%  no compress       memset
+  sparse (~5% data)           1005   4.08x      100%      432 MB/s      576 MB/s
+  16-byte records             1045   3.92x      100%     1041 MB/s     1142 MB/s
+  prose (64-word vocab)       2080   1.97x       10%      268 MB/s      428 MB/s
+  pointer array               2578   1.59x        0%      413 MB/s      864 MB/s
+  random bytes                4114   1.00x        0%      169 MB/s (stored raw)
+  ('pool ok' = compresses to <= 2048 B, the pool's acceptance limit)
+
+
+=============== 3. EFFECTIVE RAM: SAME BUDGET, WITH AND WITHOUT A COMPRESSED POOL ===============
+RAM budget: 256 frames (1024 KiB). Data: 400 pages (1.56x the budget): 20% zero, 5% same-byte, 15% sparse,
+15% records, 15% prose, 10% pointer arrays, 20% random. 150000 accesses, 85% to a 96-page hot set, 25% writes.
+Pool frames are carved OUT of the budget, so every pool frame is one fewer resident page.
+
+  pool  user     disk rd   disk wr  pool hit writeback  held pgs   capacity   SSD sec   HDD sec
+  0     256        10957      4698         0         0       256      1.00x      1.57     125.2
+  16    240         7399      3021      4727       886       299      1.17x      1.13      83.4
+  32    224         5695      2202      7756         0       319      1.25x      0.90      63.3
+  48    208         6328      2372      8502         0       312      1.22x      0.99      69.7
+  64    192         7103      2676      9423         0       306      1.20x      1.15      78.4
+  96    160         9906      4491     12366         0       293      1.14x      1.67     115.4
+  128   128        16439      8520     18514         0       279      1.09x      2.95     200.1
+
+  Best pool size on SSD: 32 frames -> 0.90 s vs 1.57 s without compression (1.7x faster)
+  Best pool size on HDD: 32 frames -> 63.3 s vs 125.2 s without compression (2.0x faster)
+  Disk I/O at that SSD optimum: 7897 ops vs 15655 (50% fewer); pool compression ratio 6.36x
+  CPU spent compressing + decompressing at that point: 113.3 ms (measured)
+  Note: times are MODELLED as disk_ops x latency (100 us SSD, 8 ms HDD) + measured
+  compression CPU time. 'capacity' = (resident + pooled pages) / RAM budget.
+
+=============== PAGE REPLACEMENT ===============
+
+Belady's anomaly, reference string 1 2 3 4 1 2 5 1 2 3 4 5 (page faults)
+  frames:     1   2   3   4   5   6   7
+  FIFO       12  12   9  10   5   5   5
+  LRU        12  12  10   8   5   5   5
+  OPT        12   9   7   6   5   5   5
+  (FIFO goes from 9 faults at 3 frames to 10 at 4: more memory, more faults)
+
+Loop over 40 pages (sequential scan), 4000 references, fault rate %
+  frames:        4       8      16      32      48
+  FIFO      100.0%  100.0%  100.0%  100.0%    1.0%
+  LRU       100.0%  100.0%  100.0%  100.0%    1.0%
+  Clock     100.0%  100.0%  100.0%  100.0%    1.0%
+  OPT        92.3%   82.2%   61.8%   21.2%    1.0%
+
+Locality: 80% of references hit 8 hot pages (of 64), 4000 references, fault rate %
+  frames:        4       8      16      32      48
+  FIFO       69.9%   50.4%   30.6%   16.8%    8.4%
+  LRU        69.8%   44.7%   20.5%   13.4%    7.0%
+  Clock      69.3%   48.0%   24.4%   13.8%    7.6%
+  OPT        46.5%   24.0%   13.4%    6.8%    3.3%
+
+Uniform random over 64 pages, 4000 references, fault rate %
+  frames:        4       8      16      32      48
+  FIFO       93.6%   87.0%   73.6%   48.9%   25.5%
+  LRU        93.7%   86.7%   73.8%   48.8%   24.8%
+  Clock      93.7%   86.9%   73.8%   49.0%   24.7%
+  OPT        75.6%   60.7%   43.0%   21.8%    9.1%
+
+Live kernel run: 256 virtual pages on 32 frames, locality workload, 20000 accesses
+  policy     faults    minor    major  evictions swap writes
+  FIFO         6240      916     5324       6208        3060
+  LRU          3997      923     3074       3965        1254
+  Clock        4536      922     3614       4504        1760
+
